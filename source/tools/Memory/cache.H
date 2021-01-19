@@ -398,8 +398,14 @@ class CACHE : public CACHE_BASE
     // modifiers
     /// Cache access from addr to addr+size-1
     bool Access(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType);
+    //smurthy
+    //selectively allocate a line based on a allocate condition
+    bool Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool allocate);
     /// Cache access at addr that does not span cache lines
     bool AccessSingleLine(ADDRINT addr, ACCESS_TYPE accessType);
+    //smurthy
+    //selectively allocate a line based on a allocate condition
+    bool AccessSingleLine_selective_allocate(ADDRINT addr, ACCESS_TYPE accessType, bool allocate);
 };
 
 /*!
@@ -441,6 +447,42 @@ bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access(ADDRINT addr, UINT32 size, ACC
     return allHit;
 }
 
+
+template <class SET, UINT32 MAX_SETS, UINT32 STORE_ALLOCATION>
+bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool selective_allocate)
+{
+    const ADDRINT highAddr = addr + size;
+    bool allHit = true;
+
+    const ADDRINT lineSize = LineSize();
+    const ADDRINT notLineMask = ~(lineSize - 1);
+    do
+    {
+        CACHE_TAG tag;
+        UINT32 setIndex;
+
+        SplitAddress(addr, tag, setIndex);
+
+        SET & set = _sets[setIndex];
+
+        bool localHit = set.Find(tag);
+        allHit &= localHit;
+
+        // on miss, loads always allocate, stores optionally
+        if ((selective_allocate) && (!localHit) && (accessType == ACCESS_TYPE_LOAD || STORE_ALLOCATION == CACHE_ALLOC::STORE_ALLOCATE))
+        {
+            set.Replace(tag);
+        }
+
+        addr = (addr & notLineMask) + lineSize; // start of next cache line
+    }
+    while (addr < highAddr);
+
+    _access[accessType][allHit]++;
+
+    return allHit;
+}
+
 /*!
  *  @return true if accessed cache line hits
  */
@@ -458,6 +500,30 @@ bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine(ADDRINT addr, ACCESS
 
     // on miss, loads always allocate, stores optionally
     if ( (! hit) && (accessType == ACCESS_TYPE_LOAD || STORE_ALLOCATION == CACHE_ALLOC::STORE_ALLOCATE))
+    {
+        set.Replace(tag);
+    }
+
+    _access[accessType][hit]++;
+
+    return hit;
+}
+
+
+template <class SET, UINT32 MAX_SETS, UINT32 STORE_ALLOCATION>
+bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_selective_allocate(ADDRINT addr, ACCESS_TYPE accessType, bool selective_allocate)
+{
+    CACHE_TAG tag;
+    UINT32 setIndex;
+
+    SplitAddress(addr, tag, setIndex);
+
+    SET & set = _sets[setIndex];
+
+    bool hit = set.Find(tag);
+
+    // on miss, loads always allocate, stores optionally
+    if ((selective_allocate)&& (! hit) && (accessType == ACCESS_TYPE_LOAD || STORE_ALLOCATION == CACHE_ALLOC::STORE_ALLOCATE))
     {
         set.Replace(tag);
     }

@@ -1,14 +1,33 @@
-/*
- * Copyright 2002-2020 Intel Corporation.
- * 
- * This software is provided to you as Sample Source Code as defined in the accompanying
- * End User License Agreement for the Intel(R) Software Development Products ("Agreement")
- * section 1.L.
- * 
- * This software and the related documents are provided as is, with no express or implied
- * warranties, other than those that are expressly stated in the License.
- */
+/*BEGIN_LEGAL 
+Intel Open Source License 
 
+Copyright (c) 2002-2017 Intel Corporation. All rights reserved.
+ 
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.  Redistributions
+in binary form must reproduce the above copyright notice, this list of
+conditions and the following disclaimer in the documentation and/or
+other materials provided with the distribution.  Neither the name of
+the Intel Corporation nor the names of its contributors may be used to
+endorse or promote products derived from this software without
+specific prior written permission.
+ 
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE INTEL OR
+ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+END_LEGAL */
 /*! @file
  *  This file contains a configurable cache class
  */
@@ -21,6 +40,9 @@
 #define MEGA (KILO*KILO)
 #define GIGA (KILO*MEGA)
 
+#define EXTRA_WAYS 3
+
+#define EXTRA_WAYS_1 3
 typedef UINT64 CACHE_STATS; // type of cache hit/miss counters
 
 #include <iostream>
@@ -31,6 +53,18 @@ using std::ostringstream;
 using namespace std;
 
 uint64_t total_accesses = 0;
+#define VICTIM_CACHE_ADDITION 0
+struct victim_buffer{
+ uint64_t addr;
+ bool valid;
+ uint64_t timestamp;
+};
+#define NUM_VICTIM_ENTRIES 32
+victim_buffer low_use_victim_entries[NUM_VICTIM_ENTRIES];
+
+bool victim_buffer_entries_initialized = false;
+
+uint64_t total_misses_on_low_use_function = 0;
 
 /*! RMR (rodric@gmail.com) 
  *   - temporary work around because decstr()
@@ -53,6 +87,22 @@ static inline bool IsPower2(UINT32 n)
 {
     return ((n & (n - 1)) == 0);
 }
+
+struct use_and_blk_addr{
+	bool function_use_information;
+	uint64_t blk_addr;
+	uint32_t allocated_way;
+	uint32_t total_low_use_misses;
+};
+
+struct hit_and_use_information{
+	bool icache_hit;
+	bool function_use_information;
+	//line addresses
+	vector<uint64_t> blk_addresses;
+	uint32_t allocated_way;
+	uint32_t total_low_use_misses;
+};
 
 /*!
  *  @brief Computes floor(log2(n))
@@ -120,7 +170,14 @@ class DIRECT_MAPPED
     UINT32 GetAssociativity(UINT32 associativity) { return 1; }
 
     UINT32 Find(CACHE_TAG tag) { return(_tag == tag); }
+    UINT32 Find(CACHE_TAG tag, bool degree_of_use) { return(_tag == tag); }
     VOID Replace(CACHE_TAG tag) { _tag = tag; }
+    use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use, uint64_t blk_addr) {
+	    use_and_blk_addr temp;
+	    temp.function_use_information = false;
+	    temp.blk_addr = 0;
+	    return temp;
+    }
 };
 
 /*!
@@ -134,6 +191,15 @@ class ROUND_ROBIN
     //add the last access number as the proxy for last reference time
     //to enable LRU based replacement
     uint64_t _tag_last_reference_time[MAX_ASSOCIATIVITY];
+    
+    //track degree of use for each block (whether it comes from a function with high use or low use)
+    //default set to low use.false indicates low use, true indicates high use.  
+    bool _degree_of_use[MAX_ASSOCIATIVITY];
+   
+
+    //store the address of the item also alongside, so we can retrieve it on a replacement. 
+    uint64_t _addr[MAX_ASSOCIATIVITY];
+    
     UINT32 _tagsLastIndex;
     UINT32 _nextReplaceIndex;
 
@@ -146,8 +212,10 @@ class ROUND_ROBIN
 
         for (INT32 index = _tagsLastIndex; index >= 0; index--)
         {
-            _tags[index] = CACHE_TAG(0);
+         _tags[index] = CACHE_TAG(0);
          _tag_last_reference_time[index] = 0;
+	 _degree_of_use[index] = false;
+	 _addr[index] = 0;
 	}
     }
 
@@ -180,6 +248,28 @@ class ROUND_ROBIN
         end: return result;
     }
 
+    //functions may start with a low degree of use and then progress to have a
+    // high degree of use. 
+    UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use)
+    {
+        bool result = true;
+	total_accesses++;
+        
+	for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+            // this is an ugly micro-optimization, but it does cause a
+            // tighter assembly loop for ARM that way ...
+            if(_tags[index] == tag) {
+		    _tag_last_reference_time[index] = total_accesses;
+		    //update the degree of use. 
+		    _degree_of_use[index] = degree_of_use;
+		    goto end;
+	    }
+//		if(_tags[index] == tag) goto end;
+        }
+        result = false;
+        end: return result;
+    }
     VOID Replace(CACHE_TAG tag)
     {
         // g++ -O3 too dumb to do CSE on following lines?!
@@ -202,6 +292,440 @@ class ROUND_ROBIN
 	
         _tags[index] = tag;
 	_tag_last_reference_time[index] = total_accesses;
+    }
+
+    use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use)
+    {
+        // g++ -O3 too dumb to do CSE on following lines?!
+      //  const UINT32 index = _nextReplaceIndex;
+
+      //  _tags[index] = tag;
+      //  // condition typically faster than modulo
+      //  _nextReplaceIndex = (index == 0 ? _tagsLastIndex : index - 1);
+    
+        uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
+        uint64_t _nextReplaceIndex = _tagsLastIndex;
+        //way 0 is for low use functions and all other ways are for high use functions. 
+	//see how this fares.
+	for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+              if(min_access_time>_tag_last_reference_time[index]){
+                 _nextReplaceIndex = index;
+                 min_access_time = _tag_last_reference_time[index];
+              }
+        }
+	const UINT32 index = _nextReplaceIndex;
+	bool replaced_block_degree_of_use = _degree_of_use[index];
+        uint64_t replaced_block_address = _addr[index];
+	use_and_blk_addr temp;
+	temp.function_use_information = replaced_block_degree_of_use;
+	temp.blk_addr = replaced_block_address;
+	_tags[index] = tag;
+	_tag_last_reference_time[index] = total_accesses;
+	_degree_of_use[index] = degree_of_use;
+	_addr[index] = blk_addr;
+	return temp;
+    }
+};
+
+template <UINT32 MAX_ASSOCIATIVITY = 4>
+class MODIFIED_CACHE
+{
+  private:
+    CACHE_TAG _tags[MAX_ASSOCIATIVITY];
+    //add the last access number as the proxy for last reference time
+    //to enable LRU based replacement
+    uint64_t _tag_last_reference_time[MAX_ASSOCIATIVITY];
+    
+    //track degree of use for each block (whether it comes from a function with high use or low use)
+    //default set to low use.false indicates low use, true indicates high use.  
+    bool _degree_of_use[MAX_ASSOCIATIVITY];
+   
+    //bit is set for low use functions whose degree of use is greater than one. 
+    bool _medium_degree_of_use[MAX_ASSOCIATIVITY];
+
+    //store the address of the item also alongside, so we can retrieve it on a replacement. 
+    uint64_t _addr[MAX_ASSOCIATIVITY];
+    
+    UINT32 _tagsLastIndex;
+    UINT32 _nextReplaceIndex;
+
+  public:
+    MODIFIED_CACHE(UINT32 associativity = MAX_ASSOCIATIVITY)
+      : _tagsLastIndex(associativity - 1)
+    {
+        ASSERTX(associativity <= MAX_ASSOCIATIVITY);
+        _nextReplaceIndex = _tagsLastIndex;
+
+        for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+         _tags[index] = CACHE_TAG(0);
+         _tag_last_reference_time[index] = 0;
+	 _degree_of_use[index] = false;
+	 _medium_degree_of_use[index] = false;
+	 _addr[index] = 0;
+	}
+	if (!victim_buffer_entries_initialized){
+	   for (INT32 index = (NUM_VICTIM_ENTRIES-1); 
+	      	  index >=0; index--)
+	  {
+	    low_use_victim_entries[_nextReplaceIndex].valid = false;
+	    low_use_victim_entries[_nextReplaceIndex].addr = 0;
+	    low_use_victim_entries[_nextReplaceIndex].timestamp = 0;
+	  }
+	  victim_buffer_entries_initialized = true;
+	}
+    }
+
+    VOID SetAssociativity(UINT32 associativity)
+    {
+        ASSERTX(associativity <= MAX_ASSOCIATIVITY);
+        _tagsLastIndex = associativity - 1;
+        _nextReplaceIndex = _tagsLastIndex;
+    }
+    UINT32 GetAssociativity(UINT32 associativity) { return _tagsLastIndex + 1; }
+    
+    UINT32 Find(CACHE_TAG tag)
+    {
+        bool result = true;
+	total_accesses++;
+        
+	for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+            // this is an ugly micro-optimization, but it does cause a
+            // tighter assembly loop for ARM that way ...
+
+            if(_tags[index] == tag) {
+		    _tag_last_reference_time[index] = total_accesses;
+		    goto end;
+	    }
+//		if(_tags[index] == tag) goto end;
+        }
+        result = false;
+
+        end: return result;
+    }
+
+    //functions may start with a low degree of use and then progress to have a
+    // high degree of use. 
+    UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use)
+    {
+        bool result = true;
+	total_accesses++;
+        bool found = false; 
+	for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+            // this is an ugly micro-optimization, but it does cause a
+            // tighter assembly loop for ARM that way ...
+
+            if(_tags[index] == tag) {
+		    _tag_last_reference_time[index] = total_accesses;
+		    
+	   	   //Retain at LRU position when the degree of use of function is 
+	   	   //low. 
+	   	   if (!degree_of_use)
+	   	  	 _tag_last_reference_time[index] = 0;
+		    //update the degree of use. 
+		    _degree_of_use[index] = degree_of_use;
+		    found = true;
+		   // goto end;
+	    }
+//		if(_tags[index] == tag) goto end;
+        }
+	//generate block address and compare against
+	//entries in the victim buffer.
+#ifdef VICTIM_CACHE_ADDITION
+	ADDRINT block_address = addr/64;
+        //check performed only for medium degree of use functions.
+	if ((!found) && (medium_degree_of_use)){
+	  for (int i = 0;i<NUM_VICTIM_ENTRIES;i++){
+	     if (low_use_victim_entries[i].valid){
+	       if (low_use_victim_entries[i].addr == 
+			       block_address){
+	           found = true;
+		   //update the timstamp so that stale low use blocks that are 
+		   //kicked out can get thrown out of the cache
+		   //sooner. 
+		   low_use_victim_entries[i].timestamp = total_accesses; 
+		}
+	     }
+	   }
+	}
+#endif
+	if (!found)	
+           result = false;
+         return result;
+    }
+    VOID Replace(CACHE_TAG tag)
+    {
+        // g++ -O3 too dumb to do CSE on following lines?!
+      //  const UINT32 index = _nextReplaceIndex;
+
+      //  _tags[index] = tag;
+      //  // condition typically faster than modulo
+      //  _nextReplaceIndex = (index == 0 ? _tagsLastIndex : index - 1);
+    
+        uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
+        uint64_t _nextReplaceIndex = _tagsLastIndex;
+        for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+          if(min_access_time>_tag_last_reference_time[index]){
+               _nextReplaceIndex = index;
+               min_access_time = _tag_last_reference_time[index];
+            }
+        }
+	const UINT32 index = _nextReplaceIndex;
+	
+        _tags[index] = tag;
+	_tag_last_reference_time[index] = total_accesses;
+    }
+
+    use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use)
+    {
+        // g++ -O3 too dumb to do CSE on following lines?!
+      //  const UINT32 index = _nextReplaceIndex;
+
+      //  _tags[index] = tag;
+      //  // condition typically faster than modulo
+      //  _nextReplaceIndex = (index == 0 ? _tagsLastIndex : index - 1);
+	
+	uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
+        uint64_t _nextReplaceIndex = _tagsLastIndex;
+        //way 0 is for low use functions and all other ways are for high use functions. 
+	//see how this fares.
+//	if (degree_of_use){
+//		for (INT32 index = _tagsLastIndex; index > (EXTRA_WAYS-1); index--)
+//        	{
+//          	   if(min_access_time>_tag_last_reference_time[index]){
+//               	      _nextReplaceIndex = index;
+//               	      min_access_time = _tag_last_reference_time[index];
+//            	   }
+//        	}
+//	}
+//	else{
+//		min_access_time = _tag_last_reference_time[(EXTRA_WAYS-1)];
+//		_nextReplaceIndex = (EXTRA_WAYS-1);
+//		for (INT32 index = (EXTRA_WAYS-1); index >= 0; index--)
+//        	{
+//          	   if(min_access_time>_tag_last_reference_time[index]){
+//               	      _nextReplaceIndex = index;
+//               	      min_access_time = _tag_last_reference_time[index];
+//            	   }
+//        	}
+//	   // _nextReplaceIndex = 0;
+//	}
+	
+	for (INT32 index = _tagsLastIndex; index >=0; index--)
+        {
+           if(min_access_time>_tag_last_reference_time[index]){
+              _nextReplaceIndex = index;
+              min_access_time = _tag_last_reference_time[index];
+           }
+        }
+	if (((_nextReplaceIndex == 0)||(_nextReplaceIndex == 1)) && (!degree_of_use))
+		total_misses_on_low_use_function++;
+	const UINT32 index = _nextReplaceIndex;
+	bool replaced_block_degree_of_use = _degree_of_use[index];
+        uint64_t replaced_block_address = _addr[index];
+	use_and_blk_addr temp;
+	temp.function_use_information = replaced_block_degree_of_use;
+        bool medium_block_degree_of_use = _medium_degree_of_use[index]; 	
+	 temp.blk_addr = replaced_block_address;
+	//if replaced block is from a low use function(deg of use > 1),
+	//then find a spot to place in the victim buffer and 
+	//place this block there. 
+	if (medium_block_degree_of_use){
+	  uint64_t block_address = temp.blk_addr/64;
+	  uint64_t min_access_time = low_use_victim_entries[NUM_VICTIM_ENTRIES-1].timestamp; 
+	  uint64_t _nextReplaceIndex = (NUM_VICTIM_ENTRIES-1);
+	  for (INT32 index = (NUM_VICTIM_ENTRIES-1); 
+			  index >=0; index--)
+	  {
+	     if(min_access_time>low_use_victim_entries[index].timestamp){
+	        _nextReplaceIndex = index;
+	        min_access_time = _tag_last_reference_time[index];
+	     }
+	  }
+	  low_use_victim_entries[_nextReplaceIndex].valid = true;
+	  low_use_victim_entries[_nextReplaceIndex].addr = block_address;
+	  //placed at MRU position for now.
+	  low_use_victim_entries[_nextReplaceIndex].timestamp = 0;
+	  
+	}
+	temp.allocated_way = index;
+	_tags[index] = tag;
+	_tag_last_reference_time[index] = total_accesses;
+	//insert at LRU position when the degree of use of function is 
+	//low. 
+	if (!degree_of_use)
+	        _tag_last_reference_time[index] = 0;
+	_degree_of_use[index] = degree_of_use;
+	_medium_degree_of_use[index] = medium_degree_of_use;
+	_addr[index] = blk_addr;
+	return temp;
+    }
+};
+
+template <UINT32 MAX_ASSOCIATIVITY = 4>
+class MODIFIED_CACHE_2
+{
+  private:
+    CACHE_TAG _tags[MAX_ASSOCIATIVITY];
+    //add the last access number as the proxy for last reference time
+    //to enable LRU based replacement
+    uint64_t _tag_last_reference_time[MAX_ASSOCIATIVITY];
+    
+    //track degree of use for each block (whether it comes from a function with high use or low use)
+    //default set to low use.false indicates low use, true indicates high use.  
+    bool _degree_of_use[MAX_ASSOCIATIVITY];
+    
+    //store the address of the item also alongside, so we can retrieve it on a replacement. 
+    uint64_t _addr[MAX_ASSOCIATIVITY];
+    
+    UINT32 _tagsLastIndex;
+    UINT32 _nextReplaceIndex;
+
+  public:
+    MODIFIED_CACHE_2(UINT32 associativity = MAX_ASSOCIATIVITY)
+      : _tagsLastIndex(associativity - 1)
+    {
+        ASSERTX(associativity <= MAX_ASSOCIATIVITY);
+        _nextReplaceIndex = _tagsLastIndex;
+
+        for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+         _tags[index] = CACHE_TAG(0);
+         _tag_last_reference_time[index] = 0;
+	 _degree_of_use[index] = false;
+	 _addr[index] = 0;
+	}
+    }
+
+    VOID SetAssociativity(UINT32 associativity)
+    {
+        ASSERTX(associativity <= MAX_ASSOCIATIVITY);
+        _tagsLastIndex = associativity - 1;
+        _nextReplaceIndex = _tagsLastIndex;
+    }
+    UINT32 GetAssociativity(UINT32 associativity) { return _tagsLastIndex + 1; }
+    
+    UINT32 Find(CACHE_TAG tag)
+    {
+        bool result = true;
+	total_accesses++;
+        
+	for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+            // this is an ugly micro-optimization, but it does cause a
+            // tighter assembly loop for ARM that way ...
+
+            if(_tags[index] == tag) {
+		    _tag_last_reference_time[index] = total_accesses;
+		    goto end;
+	    }
+//		if(_tags[index] == tag) goto end;
+        }
+        result = false;
+
+        end: return result;
+    }
+
+    //functions may start with a low degree of use and then progress to have a
+    // high degree of use. 
+    UINT32 Find_UpdateDegreeOfUse(ADDRINT addr, CACHE_TAG tag, bool degree_of_use, bool medium_degree_of_use)
+    {
+        bool result = true;
+	total_accesses++;
+        
+	for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+            // this is an ugly micro-optimization, but it does cause a
+            // tighter assembly loop for ARM that way ...
+
+            if(_tags[index] == tag) {
+		    _tag_last_reference_time[index] = total_accesses;
+		    //update the degree of use. 
+		    _degree_of_use[index] = degree_of_use;
+		    goto end;
+	    }
+//		if(_tags[index] == tag) goto end;
+        }
+        result = false;
+
+        end: return result;
+    }
+    VOID Replace(CACHE_TAG tag)
+    {
+        // g++ -O3 too dumb to do CSE on following lines?!
+      //  const UINT32 index = _nextReplaceIndex;
+
+      //  _tags[index] = tag;
+      //  // condition typically faster than modulo
+      //  _nextReplaceIndex = (index == 0 ? _tagsLastIndex : index - 1);
+    
+        uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
+        uint64_t _nextReplaceIndex = _tagsLastIndex;
+        for (INT32 index = _tagsLastIndex; index >= 0; index--)
+        {
+          if(min_access_time>_tag_last_reference_time[index]){
+               _nextReplaceIndex = index;
+               min_access_time = _tag_last_reference_time[index];
+            }
+        }
+	const UINT32 index = _nextReplaceIndex;
+	
+        _tags[index] = tag;
+	_tag_last_reference_time[index] = total_accesses;
+    }
+
+    use_and_blk_addr Replace_GetDegreeOfUse(CACHE_TAG tag, bool degree_of_use,uint64_t blk_addr, bool medium_degree_of_use)
+    {
+        // g++ -O3 too dumb to do CSE on following lines?!
+      //  const UINT32 index = _nextReplaceIndex;
+
+      //  _tags[index] = tag;
+      //  // condition typically faster than modulo
+      //  _nextReplaceIndex = (index == 0 ? _tagsLastIndex : index - 1);
+	
+	uint64_t min_access_time = _tag_last_reference_time[_tagsLastIndex];
+        uint64_t _nextReplaceIndex = _tagsLastIndex;
+        //way 0 is for low use functions and all other ways are for high use functions. 
+	//see how this fares.
+	if (degree_of_use){
+		for (INT32 index = _tagsLastIndex; index > (EXTRA_WAYS_1-1); index--)
+        	{
+          	   if(min_access_time>_tag_last_reference_time[index]){
+               	      _nextReplaceIndex = index;
+               	      min_access_time = _tag_last_reference_time[index];
+            	   }
+        	}
+	}
+	else{
+		min_access_time = _tag_last_reference_time[(EXTRA_WAYS_1-1)];
+		_nextReplaceIndex = (EXTRA_WAYS_1-1);
+		for (INT32 index = (EXTRA_WAYS_1-1); index >= 0; index--)
+        	{
+          	   if(min_access_time>_tag_last_reference_time[index]){
+               	      _nextReplaceIndex = index;
+               	      min_access_time = _tag_last_reference_time[index];
+            	   }
+        	}
+	   // _nextReplaceIndex = 0;
+	}
+	if (((_nextReplaceIndex == 0)||(_nextReplaceIndex == 1)) && (!degree_of_use))
+		total_misses_on_low_use_function++;
+	const UINT32 index = _nextReplaceIndex;
+	bool replaced_block_degree_of_use = _degree_of_use[index];
+        uint64_t replaced_block_address = _addr[index];
+	use_and_blk_addr temp;
+	temp.function_use_information = replaced_block_degree_of_use;
+	temp.blk_addr = replaced_block_address;
+	temp.allocated_way = index;
+	_tags[index] = tag;
+	_tag_last_reference_time[index] = total_accesses;
+	_degree_of_use[index] = degree_of_use;
+	_addr[index] = blk_addr;
+	return temp;
     }
 };
 
@@ -295,6 +819,22 @@ class CACHE_BASE
         SplitAddress(addr, tag, setIndex);
     }
 
+
+    VOID SpecialSplitAddress(const ADDRINT addr, CACHE_TAG & tag, UINT32 & setIndex) const
+    {
+        tag = addr >> _lineShift;
+        setIndex = tag & _setIndexMask;
+	uint64_t extra_tag_mask = tag >> _lineShift;
+	uint64_t extra_index_to_xor_with = extra_tag_mask&_setIndexMask;
+	setIndex = setIndex^extra_index_to_xor_with;	
+    }
+
+    VOID SpecialSplitAddress(const ADDRINT addr, CACHE_TAG & tag, UINT32 & setIndex, UINT32 & lineIndex) const
+    {
+        const UINT32 lineMask = _lineSize - 1;
+        lineIndex = addr & lineMask;
+        SpecialSplitAddress(addr, tag, setIndex);
+    }
     string StatsLong(string prefix = "", CACHE_TYPE = CACHE_TYPE_DCACHE) const;
 };
 
@@ -364,6 +904,10 @@ string CACHE_BASE::StatsLong(string prefix, CACHE_TYPE cache_type) const
     out += prefix + ljstr("Total-Accesses:  ", headerWidth)
            + mydecstr(Accesses(), numberWidth) +
            "  " +fltstr(100.0 * Accesses() / Accesses(), 2, 6) + "%\n";
+    
+    out += prefix + ljstr("Total-Low use misses:  ", headerWidth)
+           + mydecstr(total_misses_on_low_use_function, numberWidth) +
+           "%\n";
     out += "\n";
 
     return out;
@@ -381,7 +925,7 @@ class CACHE : public CACHE_BASE
 {
   private:
     SET _sets[MAX_SETS];
-
+    
   public:
     // constructors/destructors
     CACHE(std::string name, UINT32 cacheSize, UINT32 lineSize, UINT32 associativity)
@@ -400,12 +944,12 @@ class CACHE : public CACHE_BASE
     bool Access(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType);
     //smurthy
     //selectively allocate a line based on a allocate condition
-    bool Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool allocate);
+    hit_and_use_information Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool allocate, bool degree_of_use,bool medium_degree_of_use, bool special_cache_type);
     /// Cache access at addr that does not span cache lines
     bool AccessSingleLine(ADDRINT addr, ACCESS_TYPE accessType);
     //smurthy
     //selectively allocate a line based on a allocate condition
-    bool AccessSingleLine_selective_allocate(ADDRINT addr, ACCESS_TYPE accessType, bool allocate);
+    hit_and_use_information AccessSingleLine_selective_allocate(ADDRINT addr, ACCESS_TYPE accessType, bool allocate, bool degree_of_use, bool medium_degree_of_use, bool special_cache_type);
 };
 
 /*!
@@ -449,29 +993,48 @@ bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access(ADDRINT addr, UINT32 size, ACC
 
 
 template <class SET, UINT32 MAX_SETS, UINT32 STORE_ALLOCATION>
-bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool selective_allocate)
+hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_allocate(ADDRINT addr, UINT32 size, ACCESS_TYPE accessType, bool selective_allocate, bool degree_of_use, bool medium_degree_of_use,  bool special_cache_type)
 {
     const ADDRINT highAddr = addr + size;
     bool allHit = true;
 
     const ADDRINT lineSize = LineSize();
     const ADDRINT notLineMask = ~(lineSize - 1);
+    hit_and_use_information temp;
+    temp.icache_hit = false;
+    temp.function_use_information = false;
+    use_and_blk_addr temp1;
     do
     {
         CACHE_TAG tag;
         UINT32 setIndex;
 
-        SplitAddress(addr, tag, setIndex);
 
-        SET & set = _sets[setIndex];
-
-        bool localHit = set.Find(tag);
-        allHit &= localHit;
-
+        //SET & set;
+       //	= _sets[setIndex];
+        //bool localHit;
+       //	= set.Find_UpdateDegreeOfUse(tag, degree_of_use);
+        //search for low use function in the alternate location too, in case it is not found in the 
+	//original location. Here on we allocate this block only in the alternate location. 
+	if ((!degree_of_use) && (special_cache_type)){
+        	SplitAddress(addr, tag, setIndex);
+	}
+	else{
+        	SplitAddress(addr, tag, setIndex);
+	}
+	
+        SET &set = _sets[setIndex];
+        bool localHit = set.Find_UpdateDegreeOfUse(addr, tag, degree_of_use, medium_degree_of_use);
+	allHit &= localHit;
         // on miss, loads always allocate, stores optionally
         if ((selective_allocate) && (!localHit) && (accessType == ACCESS_TYPE_LOAD || STORE_ALLOCATION == CACHE_ALLOC::STORE_ALLOCATE))
         {
-            set.Replace(tag);
+           
+	   temp1 = set.Replace_GetDegreeOfUse(tag, degree_of_use,addr&notLineMask, medium_degree_of_use);
+	   temp.function_use_information |=temp1.function_use_information;
+	   if (temp1.function_use_information)
+	   	temp.blk_addresses.push_back(temp1.blk_addr);
+	   temp.allocated_way = temp1.allocated_way;
         }
 
         addr = (addr & notLineMask) + lineSize; // start of next cache line
@@ -479,8 +1042,10 @@ bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::Access_selective_allocate(ADDRINT add
     while (addr < highAddr);
 
     _access[accessType][allHit]++;
-
-    return allHit;
+    
+    temp.icache_hit = allHit;
+    temp.total_low_use_misses = total_misses_on_low_use_function;
+    return temp;
 }
 
 /*!
@@ -511,30 +1076,58 @@ bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine(ADDRINT addr, ACCESS
 
 
 template <class SET, UINT32 MAX_SETS, UINT32 STORE_ALLOCATION>
-bool CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_selective_allocate(ADDRINT addr, ACCESS_TYPE accessType, bool selective_allocate)
+hit_and_use_information CACHE<SET,MAX_SETS,STORE_ALLOCATION>::AccessSingleLine_selective_allocate(ADDRINT addr, ACCESS_TYPE accessType, bool selective_allocate, 
+						bool degree_of_use, bool medium_degree_of_use,  bool special_cache_type)
 {
     CACHE_TAG tag;
     UINT32 setIndex;
 
-    SplitAddress(addr, tag, setIndex);
 
-    SET & set = _sets[setIndex];
+    //SET & set; 
 
-    bool hit = set.Find(tag);
+    const ADDRINT lineSize = LineSize();
+    const ADDRINT notLineMask = ~(lineSize - 1);
+    //bool hit;
+   // = set.Find_UpdateDegreeOfUse(tag, degree_of_use);
+    //search for low use function in the alternate location too, in case it is not found in the 
+    //original location. Here on we allocate this block only in the alternate location. 
+    if ((!degree_of_use) && (special_cache_type)){
+    	SplitAddress(addr, tag, setIndex);
+    }
+    else {
+    	SplitAddress(addr, tag, setIndex);
+    }
+
+    SET &set = _sets[setIndex];
+    bool hit = set.Find_UpdateDegreeOfUse(addr, tag, degree_of_use, medium_degree_of_use);
+    hit_and_use_information temp;
+    use_and_blk_addr temp1;
+    temp.icache_hit = hit;
+    //by default return low use
+    temp.function_use_information = false;
 
     // on miss, loads always allocate, stores optionally
     if ((selective_allocate)&& (! hit) && (accessType == ACCESS_TYPE_LOAD || STORE_ALLOCATION == CACHE_ALLOC::STORE_ALLOCATE))
     {
-        set.Replace(tag);
+        
+	temp1 = set.Replace_GetDegreeOfUse(tag, degree_of_use,addr&notLineMask, medium_degree_of_use);
+	temp.function_use_information = temp1.function_use_information;
+	//Add the cacheblocks to the vector only for high use functions, because
+	//we are interested in the block addresses only for high use functions. 
+	if (temp1.function_use_information)
+	    temp.blk_addresses.push_back(temp1.blk_addr);
+	temp.allocated_way = temp1.allocated_way;
     }
 
     _access[accessType][hit]++;
-
-    return hit;
+    temp.total_low_use_misses = total_misses_on_low_use_function;
+    return temp;
 }
+
 
 // define shortcuts
 #define CACHE_DIRECT_MAPPED(MAX_SETS, ALLOCATION) CACHE<CACHE_SET::DIRECT_MAPPED, MAX_SETS, ALLOCATION>
 #define CACHE_ROUND_ROBIN(MAX_SETS, MAX_ASSOCIATIVITY, ALLOCATION) CACHE<CACHE_SET::ROUND_ROBIN<MAX_ASSOCIATIVITY>, MAX_SETS, ALLOCATION>
-
+#define CACHE_MODIFIED_CACHE(MAX_SETS, MAX_ASSOCIATIVITY, ALLOCATION) CACHE<CACHE_SET::MODIFIED_CACHE<MAX_ASSOCIATIVITY>, MAX_SETS, ALLOCATION>
+#define CACHE_MODIFIED_CACHE_2(MAX_SETS, MAX_ASSOCIATIVITY, ALLOCATION) CACHE<CACHE_SET::MODIFIED_CACHE_2<MAX_ASSOCIATIVITY>, MAX_SETS, ALLOCATION>
 #endif // PIN_CACHE_H
